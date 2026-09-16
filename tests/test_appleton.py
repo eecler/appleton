@@ -1,4 +1,6 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
@@ -6,6 +8,7 @@ from pathlib import Path
 import struct
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -82,6 +85,8 @@ class RunnerTests(unittest.TestCase):
             if command == plan['initialize']:
                 (prefix / 'system.reg').touch()
                 return 0
+            with open(prefix.with_name(prefix.name + '.appleton.lock'), 'a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.assertTrue((prefix / 'drive_c/windows/system32/d3d11.dll').is_file())
             return 7
 
@@ -96,6 +101,50 @@ class RunnerTests(unittest.TestCase):
             plan['backend'] = 'd3dmetal'
             with self.assertRaisesRegex(ValueError, 'runtime differs'):
                 runner.execute(plan)
+
+    def test_concurrent_preparation(self):
+        plan = runner.build_plan(self.args, self.cfg)
+        prefix = Path(plan['prefix'])
+        initializing = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def run(command, current_plan, phase):
+            calls.append(command)
+            if command == plan['initialize']:
+                initializing.set()
+                if not release.wait(5):
+                    raise TimeoutError('Initialization was not released')
+                (prefix / 'system.reg').touch()
+            return 0
+
+        with patch.object(runner.platform, 'system', return_value='Darwin'), \
+             patch.object(runner.platform, 'machine', return_value='arm64'), \
+             patch.object(runner.os, 'access', return_value=True), \
+             patch.object(runner, 'apfs_check'), \
+             patch.object(runner, 'run_wine', side_effect=run), \
+             ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(runner.execute, plan)
+            try:
+                self.assertTrue(initializing.wait(5))
+                second = pool.submit(runner.execute, plan)
+                self.assertFalse(second.done())
+            finally:
+                release.set()
+            self.assertEqual(first.result(timeout=5), 0)
+            self.assertEqual(second.result(timeout=5), 0)
+        self.assertEqual(calls.count(plan['initialize']), 1)
+        self.assertEqual(calls.count(plan['command']), 2)
+
+    def test_atomic_marker_failure(self):
+        marker = self.root / '.appleton.json'
+        original = {'backend': 'wine'}
+        runner.write_marker(marker, original)
+        with patch.object(runner.os, 'fsync', side_effect=OSError('Write failed')):
+            with self.assertRaisesRegex(OSError, 'Write failed'):
+                runner.write_marker(marker, {'backend': 'dxvk'})
+        self.assertEqual(json.loads(marker.read_text()), original)
+        self.assertEqual(list(self.root.glob('.appleton.json.*')), [])
 
     def test_verbose_and_log(self):
         self.args.verbose = True
@@ -126,6 +175,27 @@ class RunnerTests(unittest.TestCase):
                          [str(self.exe), '--name', 'two words', '--fullscreen'])
         self.assertEqual(cli('profile', *common, 'remove', 'my-game').returncode, 0)
         self.assertIn('Unknown profile', cli('run', *common, 'my-game').stderr)
+
+    def test_runtime_changes(self):
+        plan = runner.build_plan(self.args, self.cfg)
+        prefix = Path(plan['prefix'])
+        def run(command, current_plan, phase):
+            if phase == 'wineboot':
+                (prefix / 'system.reg').touch()
+            return 0
+        with patch.object(runner.platform, 'system', return_value='Darwin'), \
+             patch.object(runner.platform, 'machine', return_value='arm64'), \
+             patch.object(runner.os, 'access', return_value=True), \
+             patch.object(runner, 'apfs_check'), \
+             patch.object(runner, 'run_wine', side_effect=run), \
+             patch.object(runner.sys, 'stderr') as stderr:
+            runner.execute(plan)
+            self.exe.write_bytes(self.exe.read_bytes() + b'changed')
+            runner.execute(plan)
+            self.assertIn('runtime components changed', str(stderr.write.call_args_list))
+            stderr.reset_mock()
+            runner.execute(plan)
+            stderr.write.assert_not_called()
 
     def test_initialization_failure_retry(self):
         plan = runner.build_plan(self.args, self.cfg)

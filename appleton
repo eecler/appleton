@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
-import fcntl
 import configparser
+import fcntl
 import hashlib
 import json
 import os
@@ -131,10 +131,16 @@ def build_plan(args, cfg):
     launcher = ['/usr/bin/arch', '-' + host_arch, '/usr/bin/env']
     launcher += [key + '=' + value for key, value in env.items()]
     launcher += [wine]
+    runtime_paths = [wine, *[source for source, _ in copies]]
+    if backend == 'dxvk':
+        runtime_paths += [expanded(cfg[key]) for key in ('moltenvk', 'vulkan_icd') if cfg.get(key)]
+    elif backend == 'd3dmetal':
+        runtime_paths.append(expanded(cfg['d3dmetal_lib']))
     return {'architecture': target, 'backend': backend, 'prefix': str(prefix),
             'cwd': str(game), 'environment': env, 'wine': wine, 'copies': copies,
             'verbose': getattr(args, 'verbose', False),
             'log_file': expanded(args.log_file) if getattr(args, 'log_file', None) else str(prefix / 'logs/wine.log'),
+            'runtime_paths': runtime_paths,
             'initialize': launcher + ['wineboot', '-u'],
             'command': launcher + [str(exe), *args.exe_args]}
 
@@ -152,6 +158,20 @@ def write_marker(marker, identity):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def runtime_components(paths):
+    components = {}
+    for value in paths:
+        path = Path(value)
+        files = sorted(item for item in path.rglob('*') if item.is_file()) if path.is_dir() else [path]
+        for item in files:
+            digest = hashlib.sha256()
+            with item.open('rb') as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+            components[str(item)] = {'resolved': str(item.resolve()), 'sha256': digest.hexdigest()}
+    return components
 
 
 def run_wine(command, plan, phase):
@@ -197,27 +217,40 @@ def execute(plan):
         raise ValueError(f'MoltenVK library not found: {moltenvk}')
     prefix = Path(plan['prefix'])
     apfs_check(prefix)
-    marker = prefix / '.appleton.json'
-    identity = {key: plan[key] for key in ('architecture', 'backend', 'wine')}
-    if marker.exists():
-        if json.loads(marker.read_text()) != identity:
-            raise ValueError('Prefix runtime differs; select a fresh --prefix')
-    elif prefix.exists() and any(prefix.iterdir()):
-        raise ValueError('Prefix is not managed by appleton; select an empty --prefix')
-    prefix.mkdir(parents=True, exist_ok=True)
-    for directory in ('logs', 'cache'):
-        (prefix / directory).mkdir(exist_ok=True)
-    marker.write_text(json.dumps(identity, indent=2) + '\n')
-    if not (prefix / 'system.reg').exists():
-        if run_wine(plan['initialize'], plan, 'wineboot'):
-            raise ValueError(f'Prefix initialization failed; Wine: {plan["wine"]}; prefix: {prefix}; log: {plan["log_file"]}')
-    system32 = prefix / 'drive_c/windows/system32'
-    system32.mkdir(parents=True, exist_ok=True)
-    for source, name in plan['copies']:
-        destination = system32 / name
-        temporary = system32 / (name + '.appleton-tmp')
-        shutil.copy2(source, temporary)
-        temporary.replace(destination)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    with open(prefix.with_name(prefix.name + '.appleton.lock'), 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        marker = prefix / '.appleton.json'
+        identity = {key: plan[key] for key in ('architecture', 'backend', 'wine')}
+        identity['components'] = runtime_components(plan['runtime_paths'])
+        if marker.exists():
+            previous = json.loads(marker.read_text())
+            if not isinstance(previous, dict):
+                raise ValueError(f'Invalid runtime marker: {marker}')
+            if any(previous.get(key) != identity[key] for key in ('architecture', 'backend', 'wine')):
+                raise ValueError('Prefix runtime differs; select a fresh --prefix')
+            if previous.get('components') != identity['components']:
+                changed = sorted(key for key in set(previous.get('components', {})) | set(identity['components'])
+                                 if previous.get('components', {}).get(key) != identity['components'].get(key))
+                print('appleton: warning: runtime components changed: ' + ', '.join(changed), file=sys.stderr)
+        elif prefix.exists() and any(prefix.iterdir()):
+            raise ValueError('Prefix is not managed by appleton; select an empty --prefix')
+        prefix.mkdir(parents=True, exist_ok=True)
+        for directory in ('logs', 'cache'):
+            (prefix / directory).mkdir(exist_ok=True)
+        if not marker.exists():
+            write_marker(marker, identity)
+        if not (prefix / 'system.reg').exists():
+            if run_wine(plan['initialize'], plan, 'wineboot'):
+                raise ValueError(f'Prefix initialization failed; Wine: {plan["wine"]}; prefix: {prefix}; log: {plan["log_file"]}')
+        system32 = prefix / 'drive_c/windows/system32'
+        system32.mkdir(parents=True, exist_ok=True)
+        for source, name in plan['copies']:
+            destination = system32 / name
+            temporary = system32 / (name + '.appleton-tmp')
+            shutil.copy2(source, temporary)
+            temporary.replace(destination)
+        write_marker(marker, identity)
     return run_wine(plan['command'], plan, 'game')
 
 

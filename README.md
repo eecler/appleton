@@ -65,3 +65,6 @@ Wine stdout and stderr are streamed to the terminal and appended to `PREFIX/logs
 
 Profiles store absolute EXE and working-directory paths, backend, optional explicit prefix, and arguments. Saving an existing name replaces it. Run options go before the profile name; arguments after the name are appended to saved arguments. `--graphics` and `--prefix` override saved values for that run. Profiles default to `~/Library/Application Support/appleton/profiles.json`; `--profiles-file PATH` or `APPLETON_PROFILES_FILE` selects another file. Profile commands also accept `--config PATH` before positional arguments.
 
+## Runtime changes
+
+The prefix marker records SHA-256 hashes and resolved paths for Wine, copied graphics DLLs, configured MoltenVK and Vulkan ICD files, and files in the D3DMetal library directory. Changes at the same path produce a warning naming affected files. Removed components are detected as changes or missing-file errors. After successful preparation, the marker adopts the current component information and graphics DLLs are copied again. Older markers gain component information with a warning on first reuse. Architecture, backend, or Wine-path changes still require a fresh prefix.
