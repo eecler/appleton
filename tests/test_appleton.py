@@ -112,6 +112,21 @@ class RunnerTests(unittest.TestCase):
         with patch.dict(runner.os.environ, {'WINEDEBUG': '+relay'}):
             self.assertEqual(runner.build_plan(self.args, self.cfg)['environment']['WINEDEBUG'], '+relay')
 
+    def test_profiles(self):
+        profiles = self.root / 'profiles.json'
+        common = ['--profiles-file', str(profiles)]
+        def cli(*args):
+            return subprocess.run([str(ROOT / 'appleton'), *args], capture_output=True, text=True)
+        saved = cli('profile', *common, '--graphics', 'wine', 'save', 'my-game',
+                    str(self.exe), str(self.root), '--name', 'two words')
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+        result = cli('run', *common, '--dry-run', 'my-game', '--fullscreen')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['command'][-4:],
+                         [str(self.exe), '--name', 'two words', '--fullscreen'])
+        self.assertEqual(cli('profile', *common, 'remove', 'my-game').returncode, 0)
+        self.assertIn('Unknown profile', cli('run', *common, 'my-game').stderr)
+
     def test_initialization_failure_retry(self):
         plan = runner.build_plan(self.args, self.cfg)
         with patch.object(runner.platform, 'system', return_value='Darwin'), \

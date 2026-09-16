@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import configparser
 import hashlib
 import json
@@ -12,6 +13,7 @@ import shlex
 import struct
 import subprocess
 import sys
+import tempfile
 
 
 MACHINES = {0x8664: 'x86_64', 0xAA64: 'arm64', 0xA641: 'arm64ec', 0xA64E: 'arm64x'}
@@ -137,6 +139,21 @@ def build_plan(args, cfg):
             'command': launcher + [str(exe), *args.exe_args]}
 
 
+def write_marker(marker, identity):
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=marker.parent,
+                                         prefix=marker.name + '.', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(identity, indent=2) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(marker)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def run_wine(command, plan, phase):
     log = Path(plan['log_file'])
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -212,11 +229,64 @@ def main():
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--log-file')
-    parser.add_argument('exe')
-    parser.add_argument('game_dir')
+    parser.add_argument('--profiles-file', default=os.environ.get(
+        'APPLETON_PROFILES_FILE', '~/Library/Application Support/appleton/profiles.json'))
+    argv = sys.argv[1:]
+    mode = argv.pop(0) if argv and argv[0] in ('run', 'profile') else 'direct'
+    if mode == 'profile':
+        parser.add_argument('action', choices=('save', 'list', 'remove'))
+        parser.add_argument('name', nargs='?')
+        parser.add_argument('exe', nargs='?')
+        parser.add_argument('game_dir', nargs='?')
+    elif mode == 'run':
+        parser.add_argument('name')
+    else:
+        parser.add_argument('exe')
+        parser.add_argument('game_dir')
     parser.add_argument('exe_args', nargs=argparse.REMAINDER)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
+        if mode in ('profile', 'run'):
+            path = Path(expanded(args.profiles_file))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path.with_name(path.name + '.lock'), 'a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                profiles = json.loads(path.read_text()) if path.exists() else {}
+                if not isinstance(profiles, dict):
+                    raise ValueError('Profiles file must contain an object')
+                if mode == 'profile':
+                    if args.action == 'list':
+                        print(json.dumps(profiles, indent=2))
+                        return 0
+                    if not args.name:
+                        raise ValueError('Profile name is required')
+                    if args.action == 'remove':
+                        if args.name not in profiles:
+                            raise ValueError(f'Unknown profile: {args.name}')
+                        del profiles[args.name]
+                    else:
+                        if not args.exe or not args.game_dir:
+                            raise ValueError('Profile save requires EXE and game directory')
+                        plan = build_plan(args, settings(args.config))
+                        profiles[args.name] = {'exe': expanded(args.exe), 'game_dir': plan['cwd'],
+                                               'graphics': plan['backend'],
+                                               'prefix': expanded(args.prefix) if args.prefix else None,
+                                               'exe_args': args.exe_args}
+                    write_marker(path, profiles)
+                    return 0
+                if args.name not in profiles:
+                    raise ValueError(f'Unknown profile: {args.name}')
+                profile = profiles[args.name]
+                if not isinstance(profile, dict) or (profile.get('prefix') is not None and
+                        not isinstance(profile['prefix'], str)) or not all(isinstance(profile.get(key), str)
+                        for key in ('exe', 'game_dir', 'graphics')) or not isinstance(profile.get('exe_args'), list) or not all(
+                        isinstance(value, str) for value in profile['exe_args']):
+                    raise ValueError(f'Invalid profile: {args.name}')
+                args.exe = profile['exe']
+                args.game_dir = profile['game_dir']
+                args.graphics = args.graphics or profile['graphics']
+                args.prefix = args.prefix or profile.get('prefix')
+                args.exe_args = profile['exe_args'] + args.exe_args
         plan = build_plan(args, settings(args.config))
         if args.dry_run:
             print(json.dumps(plan, indent=2))

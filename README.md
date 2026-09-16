@@ -52,3 +52,16 @@ python3 -m unittest discover -s tests -v
 
 Wine stdout and stderr are streamed to the terminal and appended to `PREFIX/logs/wine.log`, including prefix initialization. `--log-file PATH` selects another file. `--verbose` prints launch commands and enables Wine exception and DLL loading diagnostics. An explicit `WINEDEBUG` environment value takes precedence. Failures report the exit status and log location; initialization failures also identify Wine and the prefix.
 
+## Profiles
+
+```sh
+./appleton profile --graphics dxvk save my-game '/path/to/game.exe' '/path/to/game' --fullscreen
+./appleton run my-game
+./appleton run --verbose my-game
+./appleton run --dry-run my-game
+./appleton profile list
+./appleton profile remove my-game
+```
+
+Profiles store absolute EXE and working-directory paths, backend, optional explicit prefix, and arguments. Saving an existing name replaces it. Run options go before the profile name; arguments after the name are appended to saved arguments. `--graphics` and `--prefix` override saved values for that run. Profiles default to `~/Library/Application Support/appleton/profiles.json`; `--profiles-file PATH` or `APPLETON_PROFILES_FILE` selects another file. Profile commands also accept `--config PATH` before positional arguments.
+
