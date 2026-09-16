@@ -43,3 +43,12 @@ Expected stdout: `appleton smoke: Windows execution OK`, exit status `0`. This t
 ```sh
 python3 -m unittest discover -s tests -v
 ```
+
+## Diagnostics
+
+```sh
+./appleton --verbose --log-file '/tmp/my-game-wine.log' '/path/to/game.exe' '/path/to/game'
+```
+
+Wine stdout and stderr are streamed to the terminal and appended to `PREFIX/logs/wine.log`, including prefix initialization. `--log-file PATH` selects another file. `--verbose` prints launch commands and enables Wine exception and DLL loading diagnostics. An explicit `WINEDEBUG` environment value takes precedence. Failures report the exit status and log location; initialization failures also identify Wine and the prefix.
+

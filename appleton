@@ -8,6 +8,7 @@ from pathlib import Path
 import platform
 import plistlib
 import shutil
+import shlex
 import struct
 import subprocess
 import sys
@@ -81,7 +82,7 @@ def build_plan(args, cfg):
     prefix = Path(expanded(args.prefix)) if args.prefix else (
         Path(expanded(cfg['prefix_root'])) / f'{game.name}-{identity}-{host_arch}-{backend}')
     env = {'WINEPREFIX': str(prefix), 'WINEARCH': 'win64',
-           'WINEDEBUG': os.environ.get('WINEDEBUG', '-all'),
+           'WINEDEBUG': os.environ.get('WINEDEBUG', '+timestamp,+pid,+tid,+seh,+loaddll' if getattr(args, 'verbose', False) else '-all'),
            'WINEMSYNC': cfg.get('winemsync', '1')}
     for key in ('DYLD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH', 'DYLD_FRAMEWORK_PATH', 'WINEDLLPATH'):
         if os.environ.get(key):
@@ -130,8 +131,37 @@ def build_plan(args, cfg):
     launcher += [wine]
     return {'architecture': target, 'backend': backend, 'prefix': str(prefix),
             'cwd': str(game), 'environment': env, 'wine': wine, 'copies': copies,
+            'verbose': getattr(args, 'verbose', False),
+            'log_file': expanded(args.log_file) if getattr(args, 'log_file', None) else str(prefix / 'logs/wine.log'),
             'initialize': launcher + ['wineboot', '-u'],
             'command': launcher + [str(exe), *args.exe_args]}
+
+
+def run_wine(command, plan, phase):
+    log = Path(plan['log_file'])
+    log.parent.mkdir(parents=True, exist_ok=True)
+    if plan['verbose']:
+        print(f'appleton: {phase}: {shlex.join(command)}', file=sys.stderr)
+        print(f'appleton: Wine log: {log}', file=sys.stderr)
+    with log.open('ab') as stream:
+        stream.write(f'\n--- {phase}: {shlex.join(command)} ---\n'.encode())
+        stream.flush()
+        try:
+            process = subprocess.Popen(command, cwd=plan['cwd'], stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT)
+        except OSError as error:
+            stream.write(f'{error}\n'.encode())
+            raise ValueError(f'{phase} could not start: {error}; Wine log: {log}') from error
+        with process:
+            while chunk := process.stdout.read1(65536):
+                stream.write(chunk)
+                stream.flush()
+                sys.stdout.write(chunk.decode('utf-8', errors='replace'))
+                sys.stdout.flush()
+            code = process.wait()
+    if code:
+        print(f'appleton: {phase} failed (exit {code}); Wine log: {log}', file=sys.stderr)
+    return code
 
 
 def execute(plan):
@@ -162,7 +192,8 @@ def execute(plan):
         (prefix / directory).mkdir(exist_ok=True)
     marker.write_text(json.dumps(identity, indent=2) + '\n')
     if not (prefix / 'system.reg').exists():
-        subprocess.run(plan['initialize'], cwd=plan['cwd'], check=True)
+        if run_wine(plan['initialize'], plan, 'wineboot'):
+            raise ValueError(f'Prefix initialization failed; Wine: {plan["wine"]}; prefix: {prefix}; log: {plan["log_file"]}')
     system32 = prefix / 'drive_c/windows/system32'
     system32.mkdir(parents=True, exist_ok=True)
     for source, name in plan['copies']:
@@ -170,7 +201,7 @@ def execute(plan):
         temporary = system32 / (name + '.appleton-tmp')
         shutil.copy2(source, temporary)
         temporary.replace(destination)
-    return subprocess.run(plan['command'], cwd=plan['cwd']).returncode
+    return run_wine(plan['command'], plan, 'game')
 
 
 def main():
@@ -179,6 +210,8 @@ def main():
     parser.add_argument('--prefix')
     parser.add_argument('--graphics', choices=('wine', 'dxvk', 'd3dmetal'))
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--verbose', action='store_true')
+    parser.add_argument('--log-file')
     parser.add_argument('exe')
     parser.add_argument('game_dir')
     parser.add_argument('exe_args', nargs=argparse.REMAINDER)

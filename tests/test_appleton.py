@@ -35,6 +35,7 @@ class RunnerTests(unittest.TestCase):
         pe(self.exe, 0x8664)
         self.cfg = runner.settings(ROOT / 'appleton.cfg')
         self.cfg['prefix_root'] = str(self.root / 'prefixes')
+        self.cfg['wine_x86_64'] = str(self.exe)
         self.args = argparse.Namespace(exe=str(self.exe), game_dir=str(self.root),
                                       graphics=None, prefix=None, exe_args=['--name', 'two words'])
 
@@ -75,26 +76,52 @@ class RunnerTests(unittest.TestCase):
         prefix = Path(plan['prefix'])
         calls = []
 
-        def run(command, **kwargs):
+        def run(command, current_plan, phase):
             calls.append(command)
-            self.assertEqual(kwargs['cwd'], str(self.root))
+            self.assertEqual(current_plan['cwd'], str(self.root))
             if command == plan['initialize']:
                 (prefix / 'system.reg').touch()
-                return subprocess.CompletedProcess(command, 0)
+                return 0
             self.assertTrue((prefix / 'drive_c/windows/system32/d3d11.dll').is_file())
-            return subprocess.CompletedProcess(command, 7)
+            return 7
 
         with patch.object(runner.platform, 'system', return_value='Darwin'), \
              patch.object(runner.platform, 'machine', return_value='arm64'), \
              patch.object(runner.os, 'access', return_value=True), \
              patch.object(runner, 'apfs_check'), \
-             patch.object(runner.subprocess, 'run', side_effect=run):
+             patch.object(runner, 'run_wine', side_effect=run):
             self.assertEqual(runner.execute(plan), 7)
             self.assertEqual(runner.execute(plan), 7)
             self.assertEqual(calls, [plan['initialize'], plan['command'], plan['command']])
             plan['backend'] = 'd3dmetal'
             with self.assertRaisesRegex(ValueError, 'runtime differs'):
                 runner.execute(plan)
+
+    def test_verbose_and_log(self):
+        self.args.verbose = True
+        with patch.dict(runner.os.environ, {}, clear=True):
+            plan = runner.build_plan(self.args, self.cfg)
+        self.assertIn('+seh', plan['environment']['WINEDEBUG'])
+        command = [runner.sys.executable, '-c',
+                   'import sys; print("stdout"); print("stderr", file=sys.stderr); sys.exit(9)']
+        with patch.object(runner.sys, 'stdout'), patch.object(runner.sys, 'stderr'):
+            self.assertEqual(runner.run_wine(command, plan, 'game'), 9)
+        log = Path(plan['log_file']).read_text()
+        self.assertIn('stdout', log)
+        self.assertIn('stderr', log)
+        with patch.dict(runner.os.environ, {'WINEDEBUG': '+relay'}):
+            self.assertEqual(runner.build_plan(self.args, self.cfg)['environment']['WINEDEBUG'], '+relay')
+
+    def test_initialization_failure_retry(self):
+        plan = runner.build_plan(self.args, self.cfg)
+        with patch.object(runner.platform, 'system', return_value='Darwin'), \
+             patch.object(runner.platform, 'machine', return_value='arm64'), \
+             patch.object(runner.os, 'access', return_value=True), \
+             patch.object(runner, 'apfs_check'), \
+             patch.object(runner, 'run_wine', return_value=3):
+            for _ in range(2):
+                with self.assertRaisesRegex(ValueError, 'initialization failed.*log:'):
+                    runner.execute(plan)
 
     def test_apfs(self):
         for fs in ('apfs', 'hfs'):
