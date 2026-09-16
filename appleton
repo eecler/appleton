@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+import argparse
+import configparser
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import plistlib
+import shutil
+import struct
+import subprocess
+import sys
+
+
+MACHINES = {0x8664: 'x86_64', 0xAA64: 'arm64', 0xA641: 'arm64ec', 0xA64E: 'arm64x'}
+
+
+def pe_arch(path):
+    with open(path, 'rb') as stream:
+        if stream.read(2) != b'MZ':
+            raise ValueError(f'Not a PE executable: {path}')
+        stream.seek(0x3C)
+        offset = struct.unpack('<I', stream.read(4))[0]
+        stream.seek(offset)
+        if stream.read(4) != b'PE\0\0':
+            raise ValueError(f'Invalid PE signature: {path}')
+        machine = struct.unpack('<H', stream.read(2))[0]
+    if machine not in MACHINES:
+        raise ValueError(f'Unsupported PE machine: 0x{machine:04x}')
+    return MACHINES[machine]
+
+
+def expanded(value):
+    return str(Path(os.path.expandvars(value)).expanduser().resolve())
+
+
+def settings(path):
+    config = configparser.ConfigParser(interpolation=None)
+    with open(path) as stream:
+        config.read_file(stream)
+    values = dict(config['appleton'])
+    for key in values:
+        values[key] = os.environ.get('APPLETON_' + key.upper(), values[key])
+    return values
+
+
+def apfs_check(path):
+    ancestor = path
+    while not ancestor.exists():
+        ancestor = ancestor.parent
+    volume = subprocess.run(['/bin/df', '-P', str(ancestor)],
+                            check=True, capture_output=True, text=True).stdout.splitlines()[-1].split()[0]
+    result = subprocess.run(['/usr/sbin/diskutil', 'info', '-plist', volume],
+                            check=True, capture_output=True)
+    info = plistlib.loads(result.stdout)
+    if info.get('FilesystemType', '').lower() != 'apfs':
+        raise ValueError(f'Prefix must reside on APFS: {path}')
+
+
+def prepend(env, key, paths):
+    parts = [str(path) for path in paths if path]
+    if env.get(key):
+        parts.append(env[key])
+    if parts:
+        env[key] = ':'.join(parts)
+
+
+def build_plan(args, cfg):
+    exe = Path(args.exe).expanduser().resolve(strict=True)
+    game = Path(args.game_dir).expanduser().resolve(strict=True)
+    if not game.is_dir():
+        raise ValueError(f'Not a game directory: {game}')
+    target = pe_arch(exe)
+    host_arch = 'x86_64' if target == 'x86_64' else 'arm64'
+    backend = args.graphics or cfg['graphics']
+    if backend not in ('wine', 'dxvk', 'd3dmetal'):
+        raise ValueError(f'Unknown graphics backend: {backend}')
+    wine = expanded(cfg['wine_' + host_arch])
+    identity = hashlib.sha256(str(game).encode()).hexdigest()[:12]
+    prefix = Path(expanded(args.prefix)) if args.prefix else (
+        Path(expanded(cfg['prefix_root'])) / f'{game.name}-{identity}-{host_arch}-{backend}')
+    env = {'WINEPREFIX': str(prefix), 'WINEARCH': 'win64',
+           'WINEDEBUG': os.environ.get('WINEDEBUG', '-all'),
+           'WINEMSYNC': cfg.get('winemsync', '1')}
+    for key in ('DYLD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH', 'DYLD_FRAMEWORK_PATH', 'WINEDLLPATH'):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    prepend(env, 'DYLD_FALLBACK_LIBRARY_PATH', [Path(wine).parent.parent / 'lib', '/usr/local/lib', '/usr/lib'])
+    copies = []
+    overrides = ['winemenubuilder.exe=d']
+    suffix = 'x64' if host_arch == 'x86_64' else 'arm64'
+    if backend == 'dxvk':
+        dxvk = cfg.get('dxvk_' + suffix, '')
+        if not dxvk:
+            raise ValueError(f'Configure dxvk_{suffix}')
+        for name in ('dxgi', 'd3d11', 'd3d10core', 'd3d9'):
+            copies.append((str(Path(expanded(dxvk)) / (name + '.dll')), name + '.dll'))
+            overrides.append(name + '=n,b')
+        vkd3d = cfg.get('vkd3d_' + suffix, '')
+        if vkd3d:
+            for name in ('d3d12', 'd3d12core'):
+                copies.append((str(Path(expanded(vkd3d)) / (name + '.dll')), name + '.dll'))
+                overrides.append(name + '=n,b')
+        moltenvk = cfg.get('moltenvk', '')
+        if not moltenvk:
+            raise ValueError('Configure moltenvk')
+        env['MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS'] = '1'
+        env['DXVK_LOG_PATH'] = str(prefix / 'logs')
+        env['DXVK_STATE_CACHE_PATH'] = str(prefix / 'cache')
+        env['VKD3D_SHADER_CACHE_PATH'] = str(prefix / 'cache')
+        env['APPLETON_MOLTENVK'] = expanded(moltenvk)
+        prepend(env, 'DYLD_LIBRARY_PATH', [Path(expanded(moltenvk)).parent])
+        if cfg.get('vulkan_icd'):
+            env['VK_ICD_FILENAMES'] = expanded(cfg['vulkan_icd'])
+    elif backend == 'd3dmetal':
+        dll_dir = cfg.get('d3dmetal_' + suffix, '')
+        if not dll_dir or not cfg.get('d3dmetal_lib'):
+            raise ValueError(f'Configure d3dmetal_{suffix} and d3dmetal_lib')
+        for name in ('dxgi', 'd3d11', 'd3d12'):
+            copies.append((str(Path(expanded(dll_dir)) / (name + '.dll')), name + '.dll'))
+            overrides.append(name + '=n,b')
+        library = expanded(cfg['d3dmetal_lib'])
+        prepend(env, 'DYLD_LIBRARY_PATH', [library])
+        prepend(env, 'DYLD_FRAMEWORK_PATH', [library])
+        prepend(env, 'WINEDLLPATH', [expanded(dll_dir)])
+    env['WINEDLLOVERRIDES'] = ';'.join(filter(None, [os.environ.get('WINEDLLOVERRIDES', ''), *overrides]))
+    launcher = ['/usr/bin/arch', '-' + host_arch, '/usr/bin/env']
+    launcher += [key + '=' + value for key, value in env.items()]
+    launcher += [wine]
+    return {'architecture': target, 'backend': backend, 'prefix': str(prefix),
+            'cwd': str(game), 'environment': env, 'wine': wine, 'copies': copies,
+            'initialize': launcher + ['wineboot', '-u'],
+            'command': launcher + [str(exe), *args.exe_args]}
+
+
+def execute(plan):
+    if platform.system() != 'Darwin' or platform.machine() not in ('arm64', 'aarch64'):
+        raise ValueError('Execution requires native Python on Apple Silicon macOS')
+    if not os.access(plan['wine'], os.X_OK):
+        raise ValueError(f'Wine executable not found: {plan["wine"]}')
+    for source, _ in plan['copies']:
+        if not Path(source).is_file():
+            raise ValueError(f'Graphics DLL not found: {source}')
+        if pe_arch(source) != plan['architecture'] and not (
+                plan['architecture'] in ('arm64ec', 'arm64x') and pe_arch(source) in ('arm64', 'arm64ec', 'arm64x')):
+            raise ValueError(f'Graphics DLL architecture mismatch: {source}')
+    moltenvk = plan['environment'].get('APPLETON_MOLTENVK')
+    if moltenvk and not Path(moltenvk).is_file():
+        raise ValueError(f'MoltenVK library not found: {moltenvk}')
+    prefix = Path(plan['prefix'])
+    apfs_check(prefix)
+    marker = prefix / '.appleton.json'
+    identity = {key: plan[key] for key in ('architecture', 'backend', 'wine')}
+    if marker.exists():
+        if json.loads(marker.read_text()) != identity:
+            raise ValueError('Prefix runtime differs; select a fresh --prefix')
+    elif prefix.exists() and any(prefix.iterdir()):
+        raise ValueError('Prefix is not managed by appleton; select an empty --prefix')
+    prefix.mkdir(parents=True, exist_ok=True)
+    for directory in ('logs', 'cache'):
+        (prefix / directory).mkdir(exist_ok=True)
+    marker.write_text(json.dumps(identity, indent=2) + '\n')
+    if not (prefix / 'system.reg').exists():
+        subprocess.run(plan['initialize'], cwd=plan['cwd'], check=True)
+    system32 = prefix / 'drive_c/windows/system32'
+    system32.mkdir(parents=True, exist_ok=True)
+    for source, name in plan['copies']:
+        destination = system32 / name
+        temporary = system32 / (name + '.appleton-tmp')
+        shutil.copy2(source, temporary)
+        temporary.replace(destination)
+    return subprocess.run(plan['command'], cwd=plan['cwd']).returncode
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Windows runner for Apple Silicon')
+    parser.add_argument('--config', default=str(Path(__file__).with_name('appleton.cfg')))
+    parser.add_argument('--prefix')
+    parser.add_argument('--graphics', choices=('wine', 'dxvk', 'd3dmetal'))
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('exe')
+    parser.add_argument('game_dir')
+    parser.add_argument('exe_args', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    try:
+        plan = build_plan(args, settings(args.config))
+        if args.dry_run:
+            print(json.dumps(plan, indent=2))
+            return 0
+        return execute(plan)
+    except (OSError, ValueError, KeyError, struct.error, configparser.Error, subprocess.CalledProcessError) as error:
+        print(f'appleton: {error}', file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == '__main__':
+    sys.exit(main())
